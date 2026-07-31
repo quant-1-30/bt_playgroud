@@ -1,0 +1,35 @@
+[tool.poetry]
+name = "xtp-service"
+version = "2.2.50.8"
+description = "XTP 量化交易服务：封装中泰 XTP C++ API 并通过 ZMQ 对外提供 RPC，部署于 ARM Linux 容器"
+authors = ["hengxinliu"]
+readme = "README.md"
+packages = [{ include = "xtp_service" }]
+package-mode = true
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.12"
+pyzmq = ">=25.0"
+msgpack = ">=1.0"
+uvloop = { version = ">=0.19", markers = "sys_platform == 'linux'" }
+tomli = { version = ">=2.0", python = "<3.11" }
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=7.4"
+pytest-asyncio = ">=0.23"
+ruff = ">=0.4"
+
+[tool.poetry.scripts]
+xtp-server = "scripts.run_server:main"
+
+[build-system]
+requires = ["poetry-core>=1.8.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
