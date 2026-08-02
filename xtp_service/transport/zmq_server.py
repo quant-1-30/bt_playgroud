@@ -20,8 +20,13 @@ class ZmqServer:
 
     def __init__(self, cfg: ZmqServerConfig) -> None:
         self.cfg = cfg
-        self.frontend_url = f"tcp://{cfg.host}:{cfg.port}"
-        self.backend_url = f"tcp://{cfg.host}:{cfg.backend_port}"
+        # 支持 IPC 或 TCP
+        if cfg.ipc_path:
+            self.frontend_url = f"ipc://{cfg.ipc_path}"
+            self.backend_url = f"ipc://{cfg.ipc_path}.backend"
+        else:
+            self.frontend_url = f"tcp://{cfg.host}:{cfg.port}"
+            self.backend_url = f"tcp://{cfg.host}:{cfg.backend_port}"
         self.loop: asyncio.AbstractEventLoop | None = None
         self.context: zmq.asyncio.Context | None = None
         self.frontend: zmq.asyncio.Socket | None = None

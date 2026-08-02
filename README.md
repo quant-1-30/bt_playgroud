@@ -1,4 +1,4 @@
-# XTP 量化交易服务（Poetry 包 + ZMQ RPC）
+# XTP + ZMQ RPC 量化交易服务
 
 中泰证券 XTP 极速交易/行情 Python API 的工程化封装。本仓库已重构为标准 Poetry 工程，通过 **ZMQ** 把 XTP 能力以 **RPC** 形式对外暴露，适配 **「XTP 服务跑在 ARM 容器、bt_studio 跑在宿主机」** 的部署拓扑。
 

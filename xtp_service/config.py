@@ -1,7 +1,3 @@
-"""服务配置：从环境变量与 config.toml 读取 XTP 连接、账号与 ZMQ 端口。
-
-优先级：环境变量 > config.toml > 默认值。
-"""
 from __future__ import annotations
 
 import os
@@ -22,7 +18,6 @@ DEFAULT_CONFIG_PATH = REPO_ROOT / "config.toml"
 
 @dataclass
 class XtpTraderConfig:
-    """交易 API 连接配置。"""
     ip: str = "122.112.139.0"
     port: int = 6202
     user: str = ""
@@ -37,7 +32,6 @@ class XtpTraderConfig:
 
 @dataclass
 class XtpQuoteConfig:
-    """行情 API 连接配置。"""
     ip: str = "119.3.103.38"
     port: int = 6002
     user: str = ""
@@ -50,12 +44,12 @@ class XtpQuoteConfig:
 
 @dataclass
 class ZmqServerConfig:
-    """ZMQ Server 监听配置。"""
     host: str = "0.0.0.0"
     port: int = 5570
     backend_port: int = 5571
     max_workers: int = 8
     rate_limit_per_minute: int = 0
+    ipc_path: str = ""  # IPC socket 路径，非空时使用 IPC 而非 TCP
 
 
 @dataclass
@@ -74,7 +68,6 @@ def _load_toml(path: Path) -> dict:
 
 
 def load_settings(config_path: Optional[Path] = None) -> Settings:
-    """合并环境变量与 TOML 配置，返回 Settings。"""
     cfg_path = Path(config_path or os.getenv("XTP_CONFIG_PATH", DEFAULT_CONFIG_PATH))
     raw = _load_toml(cfg_path)
 
@@ -112,6 +105,7 @@ def load_settings(config_path: Optional[Path] = None) -> Settings:
             backend_port=int(os.getenv("ZMQ_BACKEND_PORT", zmq_raw.get("backend_port", 5571))),
             max_workers=int(os.getenv("ZMQ_WORKERS", zmq_raw.get("max_workers", 8))),
             rate_limit_per_minute=int(os.getenv("ZMQ_RATE_LIMIT", zmq_raw.get("rate_limit_per_minute", 0))),
+            ipc_path=os.getenv("ZMQ_IPC_PATH", zmq_raw.get("ipc_path", "")),
         ),
     )
     return settings
