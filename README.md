@@ -20,26 +20,26 @@
 ## 目录结构
 
 ```
-xtp_api_python/
+bt_playgroud/
 ├── pyproject.toml              # Poetry：xtp-service 包（仅 server）
-├── config.example.toml         # 配置模板（拷为 config.toml）
 ├── xtp_service/                # 镜像内唯一 Python 包
 │   ├── config.py               #   配置加载（env + config.toml）
 │   ├── api/                    #   XTP 原生封装（容器内 Linux/ARM only）
 │   │   ├── trader_service.py   #     TraderApi：SPI C++线程→asyncio.Queue 桥接
 │   │   └── quote_service.py    #     QuoteApi：行情推送→asyncio
-│   ├── protocol/codec.py       #   msgpack 编解码
+│   ├── protocol/codec.py       #   msgpack 编解码 + RpcErrorCode
 │   ├── rpc/                    #   method→handler 分发
-│   │   ├── registry.py
+│   │   ├── registry.py         #     含 HandlerEntry / is_on_subscribe
 │   │   └── handlers.py
-│   └── transport/zmq_server.py #   ROUTER+DEALER+worker，去掉 bt_sdk 依赖
+│   └── transport/
+│       ├── zmq_server.py       #   ROUTER+DEALER+zmq.proxy+worker pool
+│       └── pubsub.py           #   BroadcastHub / Broadcaster（长连接订阅解耦）
 ├── client/                     # bt_studio 拷贝这两个文件即用
 │   ├── zmq_client.py           #   纯 asyncio DEALER：call()/subscribe()
 │   └── codec.py                #   msgpack 编解码（与 server 一致）
 ├── scripts/run_server.py       # 容器入口：加载库→登录→注册handler→起ZMQ
-├── tests/                      # 协议 + ZMQ loopback（macOS 可跑，无需原生库）
-├── source/Linux/...            # XTP C++ 源码 + 编译产物（vnxtp*.so / libxtp*api.so）
-└── XTP_API_20250806_2.2.50.8/  # 官方 SDK（头文件 + 各平台 .so/.dll）
+├── tests/                      # 协议 + ZMQ loopback + pubsub + error + timeout（macOS 可跑）
+└── docs/PERFORMANCE_AUDIT.md   # 性能审计与修复记录
 ```
 
 ## 一、容器侧（XTP 服务）部署
@@ -62,6 +62,19 @@ cp config.example.toml config.toml
 #   ZMQ_HOST / ZMQ_PORT / ZMQ_BACKEND_PORT ...
 ```
 
+#### ZMQ 配置项（`[zmq]` section）
+
+| 字段 | 环境变量 | 默认值 | 说明 |
+|---|---|---|---|
+| `host` | `ZMQ_HOST` | `0.0.0.0` | 监听地址 |
+| `port` | `ZMQ_PORT` | `5570` | frontend 端口 |
+| `backend_port` | `ZMQ_BACKEND_PORT` | `5571` | backend 端口 |
+| `max_workers` | `ZMQ_WORKERS` | `8` | worker 数量 |
+| `hwm` | `ZMQ_HWM` | `4096` | 高水位标记（原 1000 已提升） |
+| `pubsub_maxsize` | `ZMQ_PUBSUB_MAXSIZE` | `4096` | 每个订阅者队列容量 |
+| `query_timeout` | `ZMQ_QUERY_TIMEOUT` | `15.0` | XTP 查询单帧超时（秒） |
+| `enable_ipv6` | `ZMQ_ENABLE_IPV6` | `false` | 是否启用 IPv6 |
+
 ### 3. 启动
 
 ```bash
@@ -70,19 +83,13 @@ poetry run python scripts/run_server.py
 poetry run xtp-server
 ```
 
-启动后日志会打印 `ZMQ server listening on tcp://0.0.0.0:5570`。容器只需对外暴露 `5570` 端口。
-
-### 4. 原生库加载说明
-
-`xtp_service/api/__init__.py` 的 `load_native_libs()` 会把 `source/Linux/xtp_api_python3_2.2.50.8/` 与其 `xtpapi/` 子目录加入 `sys.path` 与 `LD_LIBRARY_PATH`，使 `import vnxtptrader` / `import vnxtpquote` 可用。若在 macOS 直接运行 `run_server.py`，会在登录阶段抛 `无法加载 vnxtp*.so`，属预期行为——协议与 ZMQ 层可独立测试。
-
 ## 二、宿主机侧（bt_studio）接入
 
 ### 1. 拷贝两个文件
 
-把本仓库的 `client/zmq_client.py` 与 `client/codec.py` 拷贝到 bt_studio 项目中（任意目录，二者需在同一目录）。
+把本仓库的 `client/zmq_client.py` 与 `client/codec.py` 拷贝到 bt_studio 项目中。
 
-### 2. 安装依赖（在 bt_studio 的 Poetry 项目里）
+### 2. 安装依赖
 
 ```bash
 cd /path/to/bt_studio
@@ -115,6 +122,8 @@ async def main():
 asyncio.run(main())
 ```
 
+> **IPv6 说明**：`XtpClient` 默认关闭 IPv6（`enable_ipv6=False`）。如果容器网络需要 IPv6，传 `XtpClient(endpoint, enable_ipv6=True)`。
+
 ## 三、RPC 方法清单
 
 | method | 类型 | 说明 |
@@ -127,11 +136,24 @@ asyncio.run(main())
 | `trader.query_account_trade_market` | 流式 | 查询可交易市场 |
 | `trader.insert_order` | 单响应 | 下单，params `{req}`，返回 `{order_xtp_id}` |
 | `trader.cancel_order` | 单响应 | 撤单，params `{order_xtp_id}`，返回 `{ret}` |
-| `trader.subscribe_events` | 流式 | 订阅订单/成交主动推送 |
-| `quote.subscribe_market_data` | 单响应 | 订阅行情，params `{tickers: [{ticker, exchange_id}]}` |
-| `quote.subscribe_events` | 流式 | 订阅行情推送 |
+| `trader.subscribe_events` | 流式(订阅) | 订阅订单/成交主动推送 |
+| `quote.subscribe_market_data` | 单响应 | 订阅行情，params `{tickers: [{ticker, exchange_id}]}`，按 exchange_id 分组 |
+| `quote.subscribe_events` | 流式(订阅) | 订阅行情推送 |
 
-> 流式 = 多帧响应 + 末尾 `eof`；client 的 `call()` 返回最后一帧，`subscribe()` 逐帧 yield。
+> **错误帧语义**：错误始终通过 `error` 字段返回（`{error: {code, message}}`），不会被包装为 `result`。客户端通过检查 `error` 键判断成功/失败。
+
+### 错误码
+
+| 码 | 常量 | 含义 |
+|---|---|---|
+| -32700 | PARSE_ERROR | 请求解析失败 |
+| -32601 | METHOD_NOT_FOUND | 方法未注册 |
+| -32602 | INVALID_PARAMS | 参数缺失或类型错误 |
+| -32000 | INTERNAL_ERROR | 内部异常 |
+| -32001 | SERVICE_STOPPED | 服务正在关闭 |
+| -32004 | RATE_LIMITED | 触发限流 |
+| -32010 | QUERY_TIMEOUT | XTP 查询超时（SPI 未回调） |
+| -32011 | SUBSCRIBER_GONE | 订阅者已断开 |
 
 ## 四、协议帧格式
 
@@ -139,46 +161,21 @@ asyncio.run(main())
 - 下行（server → client）：`[identity, req_id, payload]` × N + `[identity, req_id, b'eof']`
 - `payload` 为 msgpack：请求 `{method, params}` / 响应 `{result}` 或 `{error: {code, message}}`
 
+> **重要变更**：dispatch 产出的 `{"error": {...}}` 帧现在编码为 `{error: {code, message}}`（通过 `encode_response(error=...)`），不再被错误包装为 `{result: {error: ...}}`。
+
 ## 五、测试
 
 协议与 ZMQ loopback 测试不依赖 XTP 原生库，可在 macOS 直接运行：
 
 ```bash
 poetry install
-poetry run pytest tests/ -v
+python3 -m pytest tests/ -v
 ```
 
-- `tests/test_protocol.py`：msgpack 编解码往返、中文字段、client/server codec 互通。
-- `tests/test_zmq_loopback.py`：真实启动 ZMQ server + XtpClient，验证 ping/pong 与流式多帧。
-
-## 六、旧版说明
-
-- 原 `plugins/zmq_svr.py` / `plugins/zmq_client.pyx`（依赖外部 `bt_sdk`/`bt_quote`/`core.rpc.client`）已重构为本仓库的 `xtp_service/transport/zmq_server.py` 与 `client/zmq_client.py`，并去掉了外部包依赖。
-- `test/tradertest.py` / `test/quote_login_test.py` 等仍为容器内集成测试，运行时需 `LD_LIBRARY_PATH` 指向 `.so` 所在目录。
-- XTP 官方接口语义见 `source/.../xtpapi/xtp_trader_api.h`、`xtp_quote_api.h`；Python 封装方法名首字母小写，其余与 C++ 一致。
-
-"""ZMQ Server：ROUTER + DEALER + worker pool
-
-frmae：
-- client → frontend ``[req_id, payload]``
-- frontend → backend ``[identity, req_id, payload]``
-- worker backend → frontend → client ``[identity, req_id, payload]`` * N + ``[identity, req_id, b'eof']``
-"""
-
-"""XTP TraderApi 封装：把 C++ SPI 回调桥接到 asyncio。
-
-设计要点：
-- XTP 的 SPI 回调发生在 C++ 线程，必须用 `loop.call_soon_threadsafe` 跨线程投递
-- 每个查询类请求（queryAsset/queryPosition 等）可能返回多帧（is_last=False → True），
-  用 `asyncio.Queue` 按 reqid 挂起，handler `async for` 取出；
-- 订单事件（onOrderEvent/onTradeEvent）是主动推送，用单独的广播队列给所有订阅者。
-- SPI 类必须在容器内 `import vnxtptrader` 成功后才能继承 TraderApi，
-  因此用工厂函数 :func:`_make_spi_class` 延迟创建。
-"""
-
-"""容器内启动入口：加载原生库 → 登录 XTP → 注册 handlers → 启动 ZMQ serve
-运行方式容器内
-    poetry run python scripts/run_server.py
-    # 或
-    poetry run xtp-server
-"""
+测试覆盖：
+- `test_protocol.py`：msgpack 编解码往返、中文字段、client/server codec 互通、encode_error、unpack_request 容错。
+- `test_zmq_loopback.py`：真实启动 ZMQ server + XtpClient，验证 ping/pong 与流式多帧。
+- `test_zmq_loopback_ext.py`：订阅不阻塞 worker pool、突发 5000 帧背压。
+- `test_error_frames.py`：错误帧走 `error` 字段、方法未找到返回 -32601、handler 异常返回 -32000。
+- `test_pubsub.py`：BroadcastHub subscribe/publish/unsubscribe/丢弃策略/Broadcaster 帧格式。
+- `test_query_timeout.py`：XTP 查询超时保护、SPI 不回调时不泄漏协程。

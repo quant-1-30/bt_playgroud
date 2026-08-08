@@ -1,58 +1,74 @@
 from __future__ import annotations
 
-import asyncio, logging
+import asyncio
+import logging
 
 from typing import Any, Optional
 from ..config import XtpQuoteConfig
+from .base import XtpBaseService, to_serializable
 
 log = logging.getLogger(__name__)
 
 
-def _to(obj):
-    if obj is None: return None
-    if isinstance(obj, dict):
-        return {k: (v.decode("utf-8","replace") if isinstance(v,(bytes,bytearray)) else v) for k,v in obj.items()}
-    return obj
+def _make_spi_class(quote_base: type) -> type:
+    """XTP QuoteApi SPI and  delegate to QuoteService"""
+
+    class _QuoteSpi(quote_base):  # type: ignore[misc, valid-type]
+        _owner: Optional["QuoteService"] = None
+
+        def onDisconnected(self, reason):
+            if self._owner:
+                log.warning("XTP quote disconnected: reason=%s", reason)
+                self._owner._emit_event("onDisconnected", {"reason": reason})
+
+        def onError(self, data):
+            if self._owner:
+                self._owner._emit_event("onError", None, data)
+
+        def onSubMarketData(self, data, error, last):
+            if self._owner:
+                self._owner._emit_event("onSubMarketData", data, error)
+
+        def onDepthMarketData(self, data, *args):
+            if self._owner:
+                self._owner._emit_event("onDepthMarketData", data, None)
+
+        def onSubOrderBook(self, data, error, last):
+            if self._owner:
+                self._owner._emit_event("onSubOrderBook", data, error)
+
+        def onOrderBook(self, data):
+            if self._owner:
+                self._owner._emit_event("onOrderBook", data, None)
+
+        def onSubTickByTick(self, data, error, last):
+            if self._owner:
+                self._owner._emit_event("onSubTickByTick", data, error)
+
+        def onTickByTick(self, data):
+            if self._owner:
+                self._owner._emit_event("onTickByTick", data, None)
+
+        def onSubscribeAllMarketData(self, exchange_id, error):
+            if self._owner:
+                self._owner._emit_event("onSubscribeAllMarketData", {"exchange_id": exchange_id}, error)
+
+    _QuoteSpi.__name__ = "_QuoteSpi"
+    return _QuoteSpi
 
 
-def _make(base):
-    class S(base):
-        _owner = None
-        def onDisconnected(self, r):
-            if self._owner: self._owner._ev("onDisconnected", {"reason": r})
-        def onError(self, d):
-            if self._owner: self._owner._ev("onError", None, d)
-        def onSubMarketData(self, d, e, l):
-            if self._owner: self._owner._ev("onSubMarketData", d, e)
-        def onDepthMarketData(self, d, *a):
-            if self._owner: self._owner._ev("onDepthMarketData", d, None)
-        def onSubOrderBook(self, d, e, l):
-            if self._owner: self._owner._ev("onSubOrderBook", d, e)
-        def onOrderBook(self, d):
-            if self._owner: self._owner._ev("onOrderBook", d, None)
-        def onSubTickByTick(self, d, e, l):
-            if self._owner: self._owner._ev("onSubTickByTick", d, e)
-        def onTickByTick(self, d):
-            if self._owner: self._owner._ev("onTickByTick", d, None)
-        def onSubscribeAllMarketData(self, eid, e):
-            if self._owner: self._owner._ev("onSubscribeAllMarketData", {"exchange_id": eid}, e)
-    S.__name__ = "_QuoteSpi"
-    return S
+class QuoteService(XtpBaseService):
 
+    def __init__(self, cfg: XtpQuoteConfig) -> None:
+        super().__init__(cfg)
 
-class QuoteService:
-    """XTP QuoteApi SPI bridge to asyncio."""
-
-    def __init__(self, cfg):
-        self._cfg = cfg; self._loop = None; self._api = None
-        self._started = False; self._subs = []
-
-    async def start(self, loop):
+    async def start(self, loop: asyncio.AbstractEventLoop) -> None:
         from . import import_quote_api
         self._loop = loop
-        q = import_quote_api()
-        S = _make(q.QuoteApi)
-        api = S(); api._owner = self
+        vnxtpquote = import_quote_api()
+        SpiClass = _make_spi_class(vnxtpquote.QuoteApi)
+        api = SpiClass()
+        api._owner = self
         api.createQuoteApi(self._cfg.client_id, self._cfg.log_path, self._cfg.log_level)
         api.setHeartBeatInterval(self._cfg.heartbeat_interval)
         self._api = api
@@ -62,35 +78,38 @@ class QuoteService:
         self._started = True
         log.info("XTP quote logged in")
 
-    async def stop(self):
-        if not self._started: return
+    async def stop(self) -> None:
+        if not self._started:
+            return
         try:
-            if self._api: self._api.exit()
+            if self._api:
+                self._api.exit()
         finally:
             self._started = False
-            for q in self._subs:
-                try: q.put_nowait(None)
-                except: pass
+            self._force_wake_subscribers()
 
-    @property
-    def started(self): return self._started
+    # ------------------------------------------------------------------
+    # QuoteService
+    # ------------------------------------------------------------------
+    def subscribe_market_data(self, tickers: list) -> dict:
+        if not tickers:
+            return {"ret": 0}
+        return self._grouped_call(tickers, self._api.subscribeMarketData)
 
-    def _ev(self, name, data, error=None):
-        if self._loop is None: return
-        f = {"event": name, "data": _to(data), "error": _to(error)}
-        for q in list(self._subs):
-            self._loop.call_soon_threadsafe(q.put_nowait, f)
+    def unsubscribe_market_data(self, tickers: list) -> dict:
+        if not tickers:
+            return {"ret": 0}
+        return self._grouped_call(tickers, self._api.unsubscribeMarketData)
 
-    def subscribe_market_data(self, tl):
-        eid = tl[0].get("exchange_id", 2) if tl else 2
-        return {"ret": self._api.subscribeMarketData(tl, len(tl), eid)}
+    def _grouped_call(self, tickers: list, api_fn) -> dict:
+        groups: dict[int, list] = {}
+        for t in tickers:
+            eid = t.get("exchange_id", 2) if isinstance(t, dict) else 2
+            groups.setdefault(eid, []).append(t)
 
-    def unsubscribe_market_data(self, tl):
-        eid = tl[0].get("exchange_id", 2) if tl else 2
-        return {"ret": self._api.unsubscribeMarketData(tl, len(tl), eid)}
-
-    def subscribe_events(self):
-        q = asyncio.Queue(); self._subs.append(q); return q
-
-    def unsubscribe_events(self, q):
-        if q in self._subs: self._subs.remove(q)
+        rets = []
+        for eid, items in groups.items():
+            r = api_fn(items, len(items), eid)
+            rets.append(r)
+        overall = 0 if all(r == 0 for r in rets) else next(r for r in rets if r != 0)
+        return {"ret": overall, "details": [{"exchange_id": eid, "ret": r} for eid, r in zip(groups.keys(), rets)]}

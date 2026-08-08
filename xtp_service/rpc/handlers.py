@@ -2,13 +2,11 @@ from __future__ import annotations
 
 from typing import Any, AsyncIterator
 
+from xtp_service.protocol import RpcErrorCode, RpcError
 from .registry import rpc_registry
 
 
 def register_handlers(trader: Any, quote: Any) -> None:
-    # ------------------------------------------------------------------
-    # requry
-    # ------------------------------------------------------------------
     if trader is not None:
         @rpc_registry.register("trader.query_asset")
         async def _query_asset(params: dict) -> AsyncIterator[dict]:
@@ -38,21 +36,25 @@ def register_handlers(trader: Any, quote: Any) -> None:
             async for frame in trader.query_account_trade_market():
                 yield frame
 
-        # ------------------------------------------------------------------
-        # trade set / withdraw
-        # ------------------------------------------------------------------
         @rpc_registry.register("trader.insert_order")
         def _insert_order(params: dict) -> dict:
-            return trader.insert_order(params.get("req", {}))
+            req = params.get("req")
+            if not isinstance(req, dict):
+                raise RpcError(RpcErrorCode.INVALID_PARAMS, "trader.insert_order requires 'req' (dict)")
+            return trader.insert_order(req)
 
         @rpc_registry.register("trader.cancel_order")
         def _cancel_order(params: dict) -> dict:
-            return trader.cancel_order(int(params["order_xtp_id"]))
+            oid = params.get("order_xtp_id")
+            if oid is None:
+                raise RpcError(RpcErrorCode.INVALID_PARAMS, "trader.cancel_order requires 'order_xtp_id'")
+            try:
+                oid_int = int(oid)
+            except (TypeError, ValueError):
+                raise RpcError(RpcErrorCode.INVALID_PARAMS, "trader.cancel_order 'order_xtp_id' must be an integer")
+            return trader.cancel_order(oid_int)
 
-        # ------------------------------------------------------------------
-        # trade subscribe
-        # ------------------------------------------------------------------
-        @rpc_registry.register("trader.subscribe_events")
+        @rpc_registry.register("trader.subscribe_events", subscription=True)
         async def _sub_events(params: dict) -> AsyncIterator[dict]:
             q = trader.subscribe_events()
             try:
@@ -64,9 +66,6 @@ def register_handlers(trader: Any, quote: Any) -> None:
             finally:
                 trader.unsubscribe_events(q)
 
-    # ------------------------------------------------------------------
-    # subscribe quote
-    # ------------------------------------------------------------------
     if quote is not None:
         @rpc_registry.register("quote.subscribe_market_data")
         def _sub_md(params: dict) -> dict:
@@ -76,7 +75,7 @@ def register_handlers(trader: Any, quote: Any) -> None:
         def _unsub_md(params: dict) -> dict:
             return quote.unsubscribe_market_data(params.get("tickers", []))
 
-        @rpc_registry.register("quote.subscribe_events")
+        @rpc_registry.register("quote.subscribe_events", subscription=True)
         async def _quote_events(params: dict) -> AsyncIterator[dict]:
             q = quote.subscribe_events()
             try:
@@ -88,9 +87,6 @@ def register_handlers(trader: Any, quote: Any) -> None:
             finally:
                 quote.unsubscribe_events(q)
 
-    # ------------------------------------------------------------------
-    # health check
-    # ------------------------------------------------------------------
     @rpc_registry.register("ping")
     def _ping(params: dict) -> dict:
         return {

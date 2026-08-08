@@ -50,6 +50,10 @@ class ZmqServerConfig:
     max_workers: int = 8
     rate_limit_per_minute: int = 0
     ipc_path: str = ""  # IPC socket 路径，非空时使用 IPC 而非 TCP
+    hwm: int = 4096  # frontend/backend/worker 共用高水位标记（原 1000 过低，突发流量易丢帧）
+    pubsub_maxsize: int = 4096  # 每个订阅者有界队列容量
+    query_timeout: float = 15.0  # XTP 查询单帧等待超时（秒），透传给 TraderService._do_query
+    enable_ipv6: bool = False  # 明确控制 IPv6（替代 client 的魔术值 setsockopt(42,1)）
 
 
 @dataclass
